@@ -1,0 +1,27 @@
+fastapi>=0.115
+uvicorn[standard]>=0.32
+pydantic-settings>=2.6
+python-multipart>=0.0.9
+motor>=3.6
+
+langchain>=1.0
+langchain-core>=1.0
+langchain-community>=0.3
+langchain-chroma>=0.1
+langchain-text-splitters>=0.3
+langchain-openai>=0.2
+langchain-ollama>=0.2
+langchain-huggingface>=0.1
+
+chromadb>=0.5
+
+sentence-transformers>=3.0
+python-certifi-win32>=1.6
+
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=5.0
+tqdm>=4.66
+
+# Speech-to-text (Sarvam AI Saaras v3)
+sarvamai>=0.1

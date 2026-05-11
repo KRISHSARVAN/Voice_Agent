@@ -1,0 +1,291 @@
+.app {
+  min-height: 100vh;
+}
+
+/* ── Voice stage ─────────────────────────────────────────────────────────── */
+
+.voice-stage {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem 1.25rem;
+}
+
+.voice-card {
+  width: min(620px, 100%);
+  background: #fff;
+  border-radius: 26px;
+  padding: 1.4rem 1.4rem 1.15rem;
+  border: 1px solid #e5e7eb;
+  box-shadow: 0 18px 35px rgba(2, 6, 23, 0.14);
+}
+
+.header {
+  margin-bottom: 1rem;
+}
+
+.brand {
+  font-size: 1.15rem;
+  font-weight: 600;
+  letter-spacing: -0.03em;
+  text-transform: lowercase;
+}
+
+.header h1 {
+  margin: 0;
+  font-size: clamp(1.72rem, 3vw, 2.25rem);
+  font-family: 'Segoe UI', system-ui, sans-serif;
+  letter-spacing: -0.02em;
+  color: #0f172a;
+}
+
+.subtext {
+  margin: 0.25rem 0 0;
+  color: #64748b;
+  font-size: 0.92rem;
+}
+
+/* ── Status row ──────────────────────────────────────────────────────────── */
+
+.status-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  border: 1px solid #e2e8f0;
+  border-radius: 999px;
+  padding: 0.22rem 0.65rem;
+  margin-bottom: 0.9rem;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: #94a3b8;
+  transition: background 0.3s ease;
+}
+
+.status-dot.idle-off { background: #94a3b8; }
+.status-dot.ready    { background: #22c55e; }
+.status-dot.recording {
+  background: #ef4444;
+  animation: dot-pulse 1s ease-in-out infinite;
+}
+.status-dot.processing { background: #f59e0b; }
+.status-dot.speaking   { background: #2563eb; }
+
+@keyframes dot-pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.4; }
+}
+
+.status-text {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: #334155;
+}
+
+/* ── Call visualizer ─────────────────────────────────────────────────────── */
+
+.call-visualizer {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.6rem;
+  min-height: 90px;
+  margin-bottom: 1rem;
+}
+
+.phase-label {
+  margin: 0;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: #475569;
+  letter-spacing: 0.01em;
+}
+
+/* Pulse rings (recording / listening) */
+.pulse-rings {
+  position: relative;
+  width: 52px;
+  height: 52px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.pulse-rings span {
+  position: absolute;
+  border-radius: 50%;
+  border: 2px solid #ef4444;
+  animation: ring-expand 1.6s ease-out infinite;
+}
+
+.pulse-rings span:nth-child(1) { animation-delay: 0s;    width: 20px; height: 20px; }
+.pulse-rings span:nth-child(2) { animation-delay: 0.5s;  width: 20px; height: 20px; }
+.pulse-rings span:nth-child(3) { animation-delay: 1.0s;  width: 20px; height: 20px; }
+
+@keyframes ring-expand {
+  0%   { transform: scale(1);   opacity: 0.9; }
+  100% { transform: scale(2.8); opacity: 0;   }
+}
+
+/* Wave bars (agent speaking) */
+.wave-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  height: 36px;
+}
+
+.wave-bars span {
+  display: block;
+  width: 5px;
+  border-radius: 3px;
+  background: #2563eb;
+  animation: wave 0.9s ease-in-out infinite alternate;
+}
+
+.wave-bars span:nth-child(1) { height: 12px; }
+.wave-bars span:nth-child(2) { height: 28px; }
+.wave-bars span:nth-child(3) { height: 36px; }
+.wave-bars span:nth-child(4) { height: 22px; }
+.wave-bars span:nth-child(5) { height: 10px; }
+
+@keyframes wave {
+  from { transform: scaleY(0.35); }
+  to   { transform: scaleY(1); }
+}
+
+/* Spinner (processing) */
+.spinner {
+  width: 36px;
+  height: 36px;
+  border: 3px solid #e2e8f0;
+  border-top-color: #f59e0b;
+  border-radius: 50%;
+  animation: spin 0.75s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ── Call button ─────────────────────────────────────────────────────────── */
+
+.call-btn {
+  width: 100%;
+  min-height: 4.5rem;
+  border: 0;
+  border-radius: 999px;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.6rem;
+  color: #fff;
+  cursor: pointer;
+  font-family: 'Segoe UI', system-ui, sans-serif;
+  font-size: clamp(1.5rem, 3.2vw, 1.95rem);
+  font-weight: 800;
+  letter-spacing: -0.03em;
+  transition: transform 0.12s ease, box-shadow 0.2s ease, opacity 0.2s ease;
+}
+
+.call-btn.begin {
+  background: linear-gradient(180deg, #16a34a 0%, #15803d 100%);
+  box-shadow: 0 6px 18px rgba(22, 163, 74, 0.35);
+}
+
+.call-btn.begin:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 12px 24px rgba(22, 163, 74, 0.45);
+}
+
+.call-btn.end {
+  background: linear-gradient(180deg, #dc2626 0%, #991b1b 100%);
+  box-shadow: 0 6px 18px rgba(220, 38, 38, 0.35);
+}
+
+.call-btn.end:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 12px 24px rgba(220, 38, 38, 0.45);
+}
+
+.call-btn:disabled {
+  opacity: 0.62;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}
+
+.call-btn svg {
+  width: 1.5rem;
+  height: 1.5rem;
+}
+
+.call-btn span {
+  line-height: 1;
+}
+
+/* ── Error banner ─────────────────────────────────────────────────────────── */
+
+.banner.error {
+  margin-top: 0.8rem;
+  width: 100%;
+  padding: 0.6rem 0.8rem;
+  border-radius: 12px;
+  background: var(--err-bg);
+  border: 1px solid var(--err-border);
+  color: var(--err-text);
+  font-size: 0.88rem;
+  text-align: center;
+}
+
+/* ── Shared button base ──────────────────────────────────────────────────── */
+
+.btn {
+  font: inherit;
+  cursor: pointer;
+  border-radius: 999px;
+  padding: 0.35rem 0.9rem;
+  border: 1px solid var(--border);
+  background: var(--btn-bg);
+  color: var(--text);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn.secondary {
+  background: transparent;
+}
+
+.reset-btn {
+  margin-top: 0.9rem;
+  min-width: 130px;
+  background: #ffffff;
+  border-color: #d1d5db;
+  color: #111827;
+  font-weight: 600;
+}
+
+.reset-btn:hover:not(:disabled) {
+  background: #f8fafc;
+  border-color: #9ca3af;
+}
+
+@media (max-width: 640px) {
+  .voice-card {
+    border-radius: 22px;
+    padding: 1.15rem 1rem 1rem;
+  }
+
+  .call-btn {
+    min-height: 3.9rem;
+    font-size: 1.35rem;
+  }
+}
