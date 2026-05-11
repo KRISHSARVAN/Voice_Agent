@@ -14,6 +14,7 @@ const GOODBYE_PATTERNS = [
   /\b(bye|goodbye|good\s*b[uy]e?|see\s+you|see\s+ya|take\s+care|that'?s?\s+all|end\s+call|hang\s+up|talk\s+later|thanks?\s+bye|have\s+a\s+good\s+(day|night)|have\s+a\s+great\s+(day|night)|farewell|ciao|ttyl|later\s+then|i'?m\s+done)\b/i,
   /\b(thank\s+you|thanks|thank\s+u|thankyou|thx)\b/i,                           // "Thank you" closes the call
   /\b(alvida|shukriya|dhanyavaad|band\s+karo|bas\s+kar|theek\s+hai\s+bye)\b/i,  // Hindi farewells
+  /\b(aavjo|jai\s+shree\s+krishna|jay\s+shree\s+krishna|ram\s+ram|hu\s+jaish|jaish|aavjo\s+bhai|shukriya\s+bhai)\b/i, // Gujarati farewells
 ]
 
 // Check bot reply too — the LLM often recognises the farewell intent even

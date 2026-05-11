@@ -228,7 +228,7 @@ def create_app() -> FastAPI:
 
     @app.post("/v1/transcribe", tags=["stt"])
     async def transcribe(request: Request, file: UploadFile = File(...)):
-        """Accept an audio file and return its transcription via Sarvam AI Saaras v3."""
+        """Accept an audio file and return its transcription via Cartesia Ink Whisper."""
         settings: Settings = request.app.state.settings
         audio_data = await file.read()
         if not audio_data:
@@ -239,7 +239,7 @@ def create_app() -> FastAPI:
         try:
             text, language_code = await transcribe_audio(
                 audio_data,
-                api_key=settings.stt_api_key,
+                api_key=settings.cartesia_api_key,
                 content_type=file.content_type,
                 filename=file.filename,
             )
@@ -257,7 +257,7 @@ def create_app() -> FastAPI:
         text: str = Body(..., embed=True),
         language_code: str = Body("en-IN", embed=True),
     ):
-        """Convert text to speech using Sarvam AI Bulbul v3.
+        """Convert text to speech using Cartesia Sonic.
 
         Returns a newline-delimited stream of base64-encoded WAV chunks.
         Chunks are synthesized in parallel and streamed in sentence order so
@@ -274,7 +274,7 @@ def create_app() -> FastAPI:
             try:
                 async for wav_chunk in synthesize_speech_stream(
                     text.strip(),
-                    api_key=settings.tts_api_key,
+                    api_key=settings.cartesia_api_key,
                     language_code=language_code,
                 ):
                     yield base64.b64encode(wav_chunk) + b"\n"
@@ -298,7 +298,7 @@ def create_app() -> FastAPI:
         session_id = body.session_id or str(uuid.uuid4())
         user_text = body.messages[-1].content
 
-        if not settings.tts_api_key:
+        if not settings.cartesia_api_key:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="TTS is not configured on this server.",
@@ -320,7 +320,7 @@ def create_app() -> FastAPI:
                 clean = _strip_markdown(text).strip()
                 if clean:
                     task = asyncio.ensure_future(
-                        synthesize_chunk(clean, settings.tts_api_key, body.language_code, speaker)
+                        synthesize_chunk(clean, settings.cartesia_api_key, body.language_code, speaker)
                     )
                     tts_tasks.append(task)
 

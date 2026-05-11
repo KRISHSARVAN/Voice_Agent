@@ -43,14 +43,9 @@ class Settings(BaseSettings):
         description="Collection name for stored user/bot turns.",
     )
 
-    stt_api_key: str = Field(
+    cartesia_api_key: str = Field(
         default="",
-        description="Sarvam AI API subscription key for Saaras v3 speech-to-text.",
-    )
-
-    tts_api_key: str = Field(
-        default="",
-        description="Sarvam AI API subscription key for Bulbul v3 text-to-speech.",
+        description="Cartesia API key used for Ink Whisper STT and Sonic TTS.",
     )
 
     cors_origins_raw: str = Field(

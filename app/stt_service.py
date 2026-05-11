@@ -1,12 +1,25 @@
-"""Sarvam AI Saaras v3 speech-to-text service."""
+"""Cartesia Ink Whisper speech-to-text service."""
 
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
-from io import BytesIO
 
 logger = logging.getLogger(__name__)
+
+# ISO-639-1 codes returned by Cartesia → BCP-47 codes used by the rest of the app.
+_CARTESIA_LANG_TO_BCP47: dict[str, str] = {
+    "hi": "hi-IN",
+    "gu": "gu-IN",
+    "en": "en-IN",
+    "en-US": "en-IN",
+    "en-GB": "en-IN",
+    "en-IN": "en-IN",
+    "en-AU": "en-IN",
+}
+
+_STT_MODEL = "ink-whisper"
 
 _MIME_TO_EXT: dict[str, str] = {
     "audio/webm": "webm",
@@ -17,32 +30,45 @@ _MIME_TO_EXT: dict[str, str] = {
     "video/webm": "webm",
 }
 
-def _ext_from_content_type(content_type: str | None) -> str:
-    if content_type:
-        ct = content_type.split(";")[0].strip().lower()
-        if ct in _MIME_TO_EXT:
-            return _MIME_TO_EXT[ct]
-    return "webm"
 
-def _run_sarvam(audio_data: bytes, api_key: str, filename: str) -> tuple[str, str]:
+def _clean_mime(content_type: str | None) -> str:
+    """Return a bare MIME type (strip codec params, normalise video/webm)."""
+    if not content_type:
+        return "audio/webm"
+    base = content_type.split(";")[0].strip().lower()
+    if base == "video/webm":
+        return "audio/webm"
+    return base or "audio/webm"
+
+
+def _run_cartesia_stt(audio_data: bytes, api_key: str, mimetype: str) -> tuple[str, str]:
+    """Call Cartesia Ink Whisper STT and return (transcript, BCP-47 language_code)."""
     try:
-        from sarvamai import SarvamAI  # noqa: PLC0415
+        from cartesia import Cartesia  # noqa: PLC0415
     except ImportError as exc:
         raise RuntimeError(
-            "sarvamai package not installed. Run: pip install sarvamai"
+            "cartesia not installed. Run: pip install cartesia"
         ) from exc
 
-    client = SarvamAI(api_subscription_key=api_key)
-    buf = BytesIO(audio_data)
-    buf.name = filename
-    result = client.speech_to_text.transcribe(
-        file=buf,
-        model="saaras:v3",
-        mode="transcribe",
+    ext = _MIME_TO_EXT.get(mimetype, "webm")
+
+    # Wrap bytes in a BytesIO and attach a name so the SDK can infer the format.
+    audio_file = io.BytesIO(audio_data)
+    audio_file.name = f"recording.{ext}"  # type: ignore[attr-defined]
+
+    client = Cartesia(api_key=api_key)
+    response = client.stt.transcribe(
+        file=audio_file,
+        model=_STT_MODEL,
+        # Language omitted — Cartesia auto-detects it from the audio.
     )
-    transcript = (result.transcript or "").strip()
-    language_code = getattr(result, "language_code", None) or "en-IN"
+
+    transcript = (response.text or "").strip()
+    raw_lang: str = getattr(response, "language", None) or "en"
+    language_code = _CARTESIA_LANG_TO_BCP47.get(raw_lang, "en-IN")
+
     return transcript, language_code
+
 
 async def transcribe_audio(
     audio_data: bytes,
@@ -50,25 +76,32 @@ async def transcribe_audio(
     content_type: str | None = None,
     filename: str | None = None,
 ) -> tuple[str, str]:
-    """Transcribe audio bytes using Sarvam AI Saaras v3.
+    """Transcribe audio bytes using Cartesia Ink Whisper.
 
     Args:
         audio_data: Raw audio bytes from the browser (WebM/Opus, OGG, WAV …).
-        api_key: Sarvam AI API subscription key.
-        content_type: MIME type of the upload (used to pick file extension).
-        filename: Explicit filename override.
+        api_key: Cartesia API key.
+        content_type: MIME type of the upload — used to choose the file extension
+                      hint sent to Cartesia (e.g. audio/webm → recording.webm).
+        filename: Unused; kept for API compatibility.
 
     Returns:
-        Tuple of (transcribed text, detected language_code e.g. "hi-IN").
+        Tuple of (transcribed text, detected BCP-47 language_code e.g. "hi-IN").
     """
     if not api_key:
         raise RuntimeError(
-            "STT_API_KEY is not set. Add your Sarvam AI API subscription key to .env."
+            "CARTESIA_API_KEY is not set. Add your Cartesia API key to .env."
         )
 
-    ext = _ext_from_content_type(content_type)
-    resolved_name = filename or f"recording.{ext}"
-
-    text, language_code = await asyncio.to_thread(_run_sarvam, audio_data, api_key, resolved_name)
-    logger.info("Transcription done [model=saaras:v3, chars=%d, lang=%s]", len(text), language_code)
+    mimetype = _clean_mime(content_type)
+    text, language_code = await asyncio.to_thread(
+        _run_cartesia_stt, audio_data, api_key, mimetype
+    )
+    logger.info(
+        "Transcription done [model=%s, chars=%d, lang=%s, mime=%s]",
+        _STT_MODEL,
+        len(text),
+        language_code,
+        mimetype,
+    )
     return text, language_code

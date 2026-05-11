@@ -23,5 +23,5 @@ beautifulsoup4>=4.12
 lxml>=5.0
 tqdm>=4.66
 
-# Speech-to-text (Sarvam AI Saaras v3)
-sarvamai>=0.1
+# Speech-to-text + Text-to-speech (Deepgram Nova-2 STT / Aura TTS)
+deepgram-sdk>=3.0
