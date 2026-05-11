@@ -43,14 +43,9 @@ class Settings(BaseSettings):
         description="Collection name for stored user/bot turns.",
     )
 
-    stt_api_key: str = Field(
+    deepgram_api_key: str = Field(
         default="",
-        description="Sarvam AI API subscription key for Saaras v3 speech-to-text.",
-    )
-
-    tts_api_key: str = Field(
-        default="",
-        description="Sarvam AI API subscription key for Bulbul v3 text-to-speech.",
+        description="Deepgram API key for STT (flux-general-multi) and TTS (aura-2).",
     )
 
     cors_origins_raw: str = Field(

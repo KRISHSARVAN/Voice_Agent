@@ -1,48 +1,42 @@
-"""Sarvam AI Saaras v3 speech-to-text service."""
+"""Deepgram speech-to-text service (flux-general-multi)."""
 
 from __future__ import annotations
 
-import asyncio
 import logging
-from io import BytesIO
+
+import httpx
 
 logger = logging.getLogger(__name__)
 
-_MIME_TO_EXT: dict[str, str] = {
-    "audio/webm": "webm",
-    "audio/ogg": "ogg",
-    "audio/wav": "wav",
-    "audio/mpeg": "mp3",
-    "audio/mp4": "mp4",
-    "video/webm": "webm",
+STT_MODEL = "flux-general-multi"
+
+_MIME_MAP: dict[str, str] = {
+    "audio/webm": "audio/webm",
+    "audio/ogg": "audio/ogg",
+    "audio/wav": "audio/wav",
+    "audio/mpeg": "audio/mpeg",
+    "audio/mp4": "audio/mp4",
+    "video/webm": "audio/webm",
 }
 
-def _ext_from_content_type(content_type: str | None) -> str:
+_LANG_NORMALIZE: dict[str, str] = {
+    "en": "en-IN",
+    "hi": "hi-IN",
+    "gu": "gu-IN",
+    "ta": "ta-IN",
+    "te": "te-IN",
+    "mr": "mr-IN",
+    "bn": "bn-IN",
+    "kn": "kn-IN",
+}
+
+
+def _resolve_mimetype(content_type: str | None) -> str:
     if content_type:
         ct = content_type.split(";")[0].strip().lower()
-        if ct in _MIME_TO_EXT:
-            return _MIME_TO_EXT[ct]
-    return "webm"
+        return _MIME_MAP.get(ct, "audio/webm")
+    return "audio/webm"
 
-def _run_sarvam(audio_data: bytes, api_key: str, filename: str) -> tuple[str, str]:
-    try:
-        from sarvamai import SarvamAI  # noqa: PLC0415
-    except ImportError as exc:
-        raise RuntimeError(
-            "sarvamai package not installed. Run: pip install sarvamai"
-        ) from exc
-
-    client = SarvamAI(api_subscription_key=api_key)
-    buf = BytesIO(audio_data)
-    buf.name = filename
-    result = client.speech_to_text.transcribe(
-        file=buf,
-        model="saaras:v3",
-        mode="transcribe",
-    )
-    transcript = (result.transcript or "").strip()
-    language_code = getattr(result, "language_code", None) or "en-IN"
-    return transcript, language_code
 
 async def transcribe_audio(
     audio_data: bytes,
@@ -50,25 +44,48 @@ async def transcribe_audio(
     content_type: str | None = None,
     filename: str | None = None,
 ) -> tuple[str, str]:
-    """Transcribe audio bytes using Sarvam AI Saaras v3.
+    """Transcribe audio bytes using Deepgram flux-general-multi.
 
     Args:
-        audio_data: Raw audio bytes from the browser (WebM/Opus, OGG, WAV …).
-        api_key: Sarvam AI API subscription key.
-        content_type: MIME type of the upload (used to pick file extension).
-        filename: Explicit filename override.
+        audio_data: Raw audio bytes (WebM/Opus, OGG, WAV, …).
+        api_key: Deepgram API key.
+        content_type: MIME type of the upload.
+        filename: Unused; kept for API compatibility.
 
     Returns:
-        Tuple of (transcribed text, detected language_code e.g. "hi-IN").
+        Tuple of (transcribed text, detected language code e.g. "hi-IN").
     """
     if not api_key:
-        raise RuntimeError(
-            "STT_API_KEY is not set. Add your Sarvam AI API subscription key to .env."
+        raise RuntimeError("DEEPGRAM_API_KEY is not set.")
+
+    mimetype = _resolve_mimetype(content_type)
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            "https://api.deepgram.com/v2/listen",
+            headers={
+                "Authorization": f"Token {api_key}",
+                "Content-Type": mimetype,
+            },
+            content=audio_data,
+            params={
+                "model": STT_MODEL,
+                "smart_format": "true",
+                "detect_language": "true",
+            },
         )
+        response.raise_for_status()
+        data = response.json()
 
-    ext = _ext_from_content_type(content_type)
-    resolved_name = filename or f"recording.{ext}"
+    channel = data["results"]["channels"][0]
+    alternatives = channel.get("alternatives", [{}])
+    transcript = (alternatives[0].get("transcript", "") if alternatives else "").strip()
 
-    text, language_code = await asyncio.to_thread(_run_sarvam, audio_data, api_key, resolved_name)
-    logger.info("Transcription done [model=saaras:v3, chars=%d, lang=%s]", len(text), language_code)
-    return text, language_code
+    raw_lang = channel.get("detected_language", "en")
+    language_code = _LANG_NORMALIZE.get(raw_lang, raw_lang) if "-" not in raw_lang else raw_lang
+
+    logger.info(
+        "Transcription done [model=%s, chars=%d, lang=%s]",
+        STT_MODEL, len(transcript), language_code,
+    )
+    return transcript, language_code

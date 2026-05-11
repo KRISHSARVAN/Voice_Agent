@@ -23,5 +23,6 @@ beautifulsoup4>=4.12
 lxml>=5.0
 tqdm>=4.66
 
-# Speech-to-text (Sarvam AI Saaras v3)
-sarvamai>=0.1
+# Deepgram STT (flux-general-multi) + TTS (aura-2)
+httpx>=0.27
+websockets>=13.0
