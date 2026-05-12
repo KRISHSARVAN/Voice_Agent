@@ -126,7 +126,7 @@ async def synthesize_speech(text: str, api_key: str, language_code: str = TTS_DE
     """Convert text to speech — returns a single merged WAV (used for testing/fallback)."""
     if not api_key:
         raise RuntimeError(
-            "STT_API_KEY is not set. Add your Sarvam AI API subscription key to .env."
+            "TTS_API_KEY is not set. Add your Sarvam AI API subscription key to .env."
         )
     parts: list[bytes] = [chunk async for chunk in synthesize_speech_stream(text, api_key, language_code)]
     return _combine_wav(parts)
@@ -145,7 +145,7 @@ async def synthesize_speech_stream(
     """
     if not api_key:
         raise RuntimeError(
-            "STT_API_KEY is not set. Add your Sarvam AI API subscription key to .env."
+            "TTS_API_KEY is not set. Add your Sarvam AI API subscription key to .env."
         )
 
     lang = language_code if language_code in _SUPPORTED_LANGUAGES else TTS_DEFAULT_LANGUAGE
