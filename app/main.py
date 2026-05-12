@@ -277,6 +277,9 @@ def create_app() -> FastAPI:
                     api_key=settings.tts_api_key,
                     language_code=language_code,
                 ):
+                    if await request.is_disconnected():
+                        logger.info("Client disconnected during TTS synthesis, stopping")
+                        return
                     yield base64.b64encode(wav_chunk) + b"\n"
             except Exception:
                 logger.exception("TTS synthesis failed mid-stream")
@@ -307,7 +310,6 @@ def create_app() -> FastAPI:
         pairs_out: list = []
         answer_parts: list[str] = []
 
-        # Sentence boundary pattern — split on punctuation followed by whitespace.
         _sentence_re = re.compile(r'(?<=[.!?।])\s+')
 
         async def audio_stream():
@@ -315,6 +317,22 @@ def create_app() -> FastAPI:
             sentence_buf = ""
             tts_tasks: list[asyncio.Task] = []
             yielded_count = 0
+            interrupted = False
+
+            async def _is_disconnected() -> bool:
+                return await request.is_disconnected()
+
+            async def _cancel_remaining_tasks(tasks: list[asyncio.Task], from_idx: int) -> None:
+                """Cancel all pending TTS tasks from from_idx onwards."""
+                for t in tasks[from_idx:]:
+                    if not t.done():
+                        t.cancel()
+                for t in tasks[from_idx:]:
+                    if not t.done():
+                        try:
+                            await t
+                        except (asyncio.CancelledError, Exception):
+                            pass
 
             async def _queue_tts(text: str) -> None:
                 clean = _strip_markdown(text).strip()
@@ -333,17 +351,20 @@ def create_app() -> FastAPI:
                     language_code=body.language_code,
                     pairs_out=pairs_out,
                 ):
+                    if await _is_disconnected():
+                        logger.info("Client disconnected during LLM stream, aborting voice pipeline")
+                        interrupted = True
+                        break
+
                     answer_parts.append(token)
                     sentence_buf += token
 
-                    # Fire TTS for every complete sentence detected so far.
                     parts = _sentence_re.split(sentence_buf)
                     if len(parts) > 1:
                         for sentence in parts[:-1]:
                             await _queue_tts(sentence)
                         sentence_buf = parts[-1]
 
-                    # Yield any TTS chunks that finished (in order, no waiting).
                     while yielded_count < len(tts_tasks) and tts_tasks[yielded_count].done():
                         try:
                             wav = tts_tasks[yielded_count].result()
@@ -355,15 +376,27 @@ def create_app() -> FastAPI:
             except Exception:
                 logger.exception("LLM streaming failed in voice pipeline")
 
+            if interrupted:
+                await _cancel_remaining_tasks(tts_tasks, yielded_count)
+                logger.info("Voice pipeline aborted — cancelled %d pending TTS tasks",
+                            len(tts_tasks) - yielded_count)
+                return
+
             # Flush the final sentence fragment (no trailing punctuation).
             if sentence_buf.strip():
                 await _queue_tts(sentence_buf)
 
             # Await and yield remaining TTS tasks in order.
             for i in range(yielded_count, len(tts_tasks)):
+                if await _is_disconnected():
+                    logger.info("Client disconnected during TTS delivery, cancelling remaining")
+                    await _cancel_remaining_tasks(tts_tasks, i)
+                    return
                 try:
                     wav = await tts_tasks[i]
                     yield base64.b64encode(wav) + b"\n"
+                except asyncio.CancelledError:
+                    logger.info("TTS chunk %d cancelled", i)
                 except Exception:
                     logger.exception("TTS chunk %d failed, skipping", i)
 

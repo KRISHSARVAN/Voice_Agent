@@ -7,6 +7,8 @@ const SESSION_STORAGE_KEY = 'suvit_chat_session_id'
 const SILENCE_THRESHOLD = 0.015  // RMS level below which we consider silence
 const SILENCE_DURATION_MS = 1800 // consecutive ms of silence → auto-stop
 const MIN_SPEECH_MS = 400        // don't trigger silence detection in first N ms
+const MIN_RECORDING_MS = 600     // discard recordings shorter than this (avoids sending noise/empty audio)
+const MAX_RECORDING_MS = 30000   // hard cap — force-stop recording after this (safety net)
 
 // Barge-in detection tuning
 const BARGE_IN_THRESHOLD = 0.025 // RMS level to trigger barge-in (slightly above silence threshold)
@@ -114,6 +116,23 @@ export default function App() {
   // Ref to the active pipeline stream reader so barge-in can cancel it
   const currentReaderRef = useRef<ReadableStreamDefaultReader<Uint8Array> | null>(null)
 
+  // AbortController for the active fetch so we can signal the server on interrupt
+  const abortCtrlRef = useRef<AbortController | null>(null)
+
+  // Track scheduled AudioBufferSourceNodes so we can .stop() them immediately
+  const activeSourcesRef = useRef<AudioBufferSourceNode[]>([])
+
+  // Prevent concurrent pipeline runs that cause audio overlap
+  const pipelineRunningRef = useRef(false)
+
+  // Generation counter: each runPipeline increments this. Stale pipelines
+  // check their captured generation before touching shared state and bail out
+  // if a newer pipeline has started.
+  const pipelineGenRef = useRef(0)
+
+  // Safety-net timer to force-stop recording if silence detection stalls
+  const maxRecordTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
   useEffect(() => {
     callActiveRef.current = callActive
   }, [callActive])
@@ -126,6 +145,10 @@ export default function App() {
   }
 
   const stopAudio = () => {
+    for (const src of activeSourcesRef.current) {
+      try { src.stop() } catch { /* already stopped */ }
+    }
+    activeSourcesRef.current = []
     if (audioCtxRef.current) {
       audioCtxRef.current.close().catch(() => {})
       audioCtxRef.current = null
@@ -158,8 +181,13 @@ export default function App() {
     }
   }
 
-  /** Cancel the active HTTP stream reader and stop audio playback. */
+  /** Cancel the active HTTP stream reader, abort fetch, and stop audio playback. */
   const cancelCurrentPlayback = () => {
+    // Abort the fetch first — this signals the server to stop LLM + TTS work
+    if (abortCtrlRef.current) {
+      abortCtrlRef.current.abort()
+      abortCtrlRef.current = null
+    }
     if (currentReaderRef.current) {
       currentReaderRef.current.cancel().catch(() => {})
       currentReaderRef.current = null
@@ -169,12 +197,21 @@ export default function App() {
 
   // ── Call lifecycle ────────────────────────────────────────────────────────
 
+  const clearMaxRecordTimer = () => {
+    if (maxRecordTimerRef.current !== null) {
+      clearTimeout(maxRecordTimerRef.current)
+      maxRecordTimerRef.current = null
+    }
+  }
+
   const endCall = () => {
     callActiveRef.current = false
     setCallActive(false)
     bargingInRef.current = false
+    pipelineRunningRef.current = false
     cancelCurrentPlayback()
     stopSilenceDetection()
+    clearMaxRecordTimer()
     stopBargeInMonitor()
     if (
       mediaRecorderRef.current &&
@@ -209,121 +246,175 @@ export default function App() {
     }
   }
 
-  const runPipeline = async (blob: Blob, mimeType: string) => {
+  const runPipeline = async (blob: Blob, _mimeType?: string) => {
     if (!callActiveRef.current) return
+
+    // Kill any leftover audio from a previous pipeline run
+    cancelCurrentPlayback()
+    pipelineRunningRef.current = true
+
+    // Capture a generation number — if a newer pipeline starts while this
+    // one is still awaiting async work, the stale pipeline will see a
+    // mismatched gen and bail out instead of stomping on shared state.
+    const gen = ++pipelineGenRef.current
+    const isStale = () => pipelineGenRef.current !== gen
+
     setPhase('processing')
     setError(null)
 
-    // 1. Transcribe
-    let userText = ''
-    let detectedLang = 'en-IN'
     let farewell = false
+
     try {
-      // Sarvam Saaras v3 does not accept WebM/Opus. Convert to 16 kHz mono WAV first.
-      let uploadBlob: Blob = blob
-      let uploadName = 'recording.wav'
+      // 1. Transcribe
+      let userText = ''
+      let detectedLang = 'en-IN'
       try {
-        uploadBlob = await blobToWav(blob)
-      } catch {
-        // Conversion failed (unlikely) — fall back to raw blob with original extension
-        const ext = mimeType.includes('ogg') ? 'ogg' : mimeType.includes('mp4') ? 'mp4' : 'webm'
-        uploadName = `recording.${ext}`
-        uploadBlob = blob
-      }
-      const form = new FormData()
-      form.append('file', uploadBlob, uploadName)
-      const r = await fetch('/v1/transcribe', { method: 'POST', body: form })
-      const data = (await r.json().catch(() => ({}))) as {
-        text?: string
-        language_code?: string
-        detail?: unknown
-      }
-      if (!r.ok) {
-        throw new Error(
-          typeof data.detail === 'string'
-            ? data.detail
-            : r.statusText || 'Transcription failed',
-        )
-      }
-      userText = (data.text ?? '').trim()
-      detectedLang = data.language_code ?? 'en-IN'
-      farewell = isGoodbye(userText)
-      if (!userText) {
-        // Nothing heard — go straight back to listening
-        onPipelineDone()
+        let uploadBlob: Blob
+        try {
+          uploadBlob = await blobToWav(blob)
+        } catch {
+          if (!isStale()) onPipelineDone()
+          return
+        }
+        if (uploadBlob.size < 1024) {
+          if (!isStale()) onPipelineDone()
+          return
+        }
+        const form = new FormData()
+        form.append('file', uploadBlob, 'recording.wav')
+        const r = await fetch('/v1/transcribe', { method: 'POST', body: form })
+        if (isStale()) return
+        const data = (await r.json().catch(() => ({}))) as {
+          text?: string
+          language_code?: string
+          detail?: unknown
+        }
+        if (!r.ok) {
+          throw new Error(
+            typeof data.detail === 'string'
+              ? data.detail
+              : r.statusText || 'Transcription failed',
+          )
+        }
+        userText = (data.text ?? '').trim()
+        detectedLang = data.language_code ?? 'en-IN'
+        farewell = isGoodbye(userText)
+        if (!userText) {
+          if (!isStale()) onPipelineDone()
+          return
+        }
+      } catch (e) {
+        if (!isStale()) {
+          setError(e instanceof Error ? e.message : 'Transcription failed')
+          onPipelineDone()
+        }
         return
       }
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Transcription failed')
-      onPipelineDone()
-      return
-    }
 
-    // 2+3. Real-time voice pipeline — LLM streams tokens → TTS fires per sentence → audio plays.
-    // The server sends newline-delimited lines: base64 WAV chunks + a final `data:{…}` JSON line.
-    if (!callActiveRef.current) return
-    try {
-      const r = await fetch('/v1/voice', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          messages: [{ role: 'user', content: userText }],
-          session_id: sessionId || null,
-          include_sources: false,
-          language_code: detectedLang,
-        }),
-      })
-      if (!r.ok || !r.body) {
-        const data = (await r.json().catch(() => ({}))) as { detail?: unknown }
-        throw new Error(
-          typeof data.detail === 'string' ? data.detail : 'Voice pipeline failed',
-        )
-      }
-
-      const ctx = new AudioContext()
-      audioCtxRef.current = ctx
-      let nextStartTime = ctx.currentTime
-      setPhase('speaking')
-
-      // Start monitoring for barge-in as soon as bot audio begins
-      void startBargeInMonitor()
-
-      const decodeAndQueue = async (b64line: string): Promise<void> => {
-        const binary = atob(b64line)
-        const bytes = new Uint8Array(binary.length)
-        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
-        const audioBuf = await ctx.decodeAudioData(bytes.buffer.slice(0))
-        if (ctx.state === 'closed') return
-        const source = ctx.createBufferSource()
-        source.buffer = audioBuf
-        source.connect(ctx.destination)
-        const startAt = Math.max(ctx.currentTime, nextStartTime)
-        source.start(startAt)
-        nextStartTime = startAt + audioBuf.duration
-      }
-
-      const reader = r.body.getReader()
-      currentReaderRef.current = reader
-      const decoder = new TextDecoder()
-      let buf = ''
-
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        // Stop if call ended OR user barged in
-        if (!callActiveRef.current || bargingInRef.current) {
-          reader.cancel().catch(() => {})
-          currentReaderRef.current = null
-          break
+      // 2+3. Voice pipeline: LLM streams → TTS per sentence → audio plays.
+      if (!callActiveRef.current || isStale()) return
+      try {
+        const abortCtrl = new AbortController()
+        abortCtrlRef.current = abortCtrl
+        const r = await fetch('/v1/voice', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            messages: [{ role: 'user', content: userText }],
+            session_id: sessionId || null,
+            include_sources: false,
+            language_code: detectedLang,
+          }),
+          signal: abortCtrl.signal,
+        })
+        if (isStale()) return
+        if (!r.ok || !r.body) {
+          const data = (await r.json().catch(() => ({}))) as { detail?: unknown }
+          throw new Error(
+            typeof data.detail === 'string' ? data.detail : 'Voice pipeline failed',
+          )
         }
-        buf += decoder.decode(value, { stream: true })
-        const lines = buf.split('\n')
-        buf = lines.pop() ?? ''
-        for (const line of lines) {
-          const trimmed = line.trim()
-          if (!trimmed) continue
+
+        stopAudio()
+
+        const ctx = new AudioContext()
+        audioCtxRef.current = ctx
+        activeSourcesRef.current = []
+        let nextStartTime = ctx.currentTime
+        setPhase('speaking')
+
+        void startBargeInMonitor()
+
+        const decodeAndQueue = async (b64line: string): Promise<void> => {
+          const binary = atob(b64line)
+          const bytes = new Uint8Array(binary.length)
+          for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+          const audioBuf = await ctx.decodeAudioData(bytes.buffer.slice(0))
+          if (ctx.state === 'closed' || isStale()) return
+          const source = ctx.createBufferSource()
+          source.buffer = audioBuf
+          source.connect(ctx.destination)
+          const startAt = Math.max(ctx.currentTime, nextStartTime)
+          source.start(startAt)
+          nextStartTime = startAt + audioBuf.duration
+          activeSourcesRef.current.push(source)
+          source.onended = () => {
+            activeSourcesRef.current = activeSourcesRef.current.filter((s) => s !== source)
+          }
+        }
+
+        const reader = r.body.getReader()
+        currentReaderRef.current = reader
+        const decoder = new TextDecoder()
+        let buf = ''
+
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          if (!callActiveRef.current || bargingInRef.current || isStale()) {
+            reader.cancel().catch(() => {})
+            currentReaderRef.current = null
+            break
+          }
+          buf += decoder.decode(value, { stream: true })
+          const lines = buf.split('\n')
+          buf = lines.pop() ?? ''
+          for (const line of lines) {
+            const trimmed = line.trim()
+            if (!trimmed) continue
+            if (trimmed.startsWith('data:')) {
+              try {
+                const meta = JSON.parse(trimmed.slice(5)) as {
+                  session_id?: string
+                  answer?: string
+                }
+                if (meta.session_id) rememberSession(meta.session_id)
+                const answer = (meta.answer ?? '').trim()
+                if (!farewell && isBotFarewell(answer)) farewell = true
+              } catch { /* ignore malformed metadata */ }
+            } else {
+              await decodeAndQueue(trimmed)
+            }
+          }
+        }
+
+        currentReaderRef.current = null
+        abortCtrlRef.current = null
+
+        // Stale pipeline — a newer one took over, don't touch shared state
+        if (isStale()) return
+
+        // Barge-in happened — handleBargeIn already started recording
+        if (bargingInRef.current) {
+          stopAudio()
+          stopBargeInMonitor()
+          return
+        }
+
+        // Process remaining buffered content
+        if (buf.trim() && callActiveRef.current) {
+          const trimmed = buf.trim()
           if (trimmed.startsWith('data:')) {
-            // Final metadata line — update session and detect farewell.
             try {
               const meta = JSON.parse(trimmed.slice(5)) as {
                 session_id?: string
@@ -332,65 +423,51 @@ export default function App() {
               if (meta.session_id) rememberSession(meta.session_id)
               const answer = (meta.answer ?? '').trim()
               if (!farewell && isBotFarewell(answer)) farewell = true
-            } catch { /* ignore malformed metadata */ }
+            } catch { /* ignore */ }
           } else {
             await decodeAndQueue(trimmed)
           }
         }
-      }
 
-      currentReaderRef.current = null
+        if (isStale()) return
 
-      // If user interrupted, skip the remaining audio wait and return — 
-      // handleBargeIn already switched phase to 'recording'
-      if (bargingInRef.current) {
-        if (ctx.state !== 'closed') ctx.close().catch(() => {})
+        const remaining = (nextStartTime - ctx.currentTime) * 1000
+        if (remaining > 0 && callActiveRef.current && !isStale()) {
+          await new Promise<void>((res) => setTimeout(res, remaining + 150))
+        }
+        if (isStale()) return
+
+        activeSourcesRef.current = []
+        if (ctx.state !== 'closed') await ctx.close()
         audioCtxRef.current = null
-        stopBargeInMonitor()
-        return
-      }
 
-      // Process any remaining buffered content.
-      if (buf.trim() && callActiveRef.current) {
-        const trimmed = buf.trim()
-        if (trimmed.startsWith('data:')) {
-          try {
-            const meta = JSON.parse(trimmed.slice(5)) as {
-              session_id?: string
-              answer?: string
-            }
-            if (meta.session_id) rememberSession(meta.session_id)
-            const answer = (meta.answer ?? '').trim()
-            if (!farewell && isBotFarewell(answer)) farewell = true
-          } catch { /* ignore */ }
-        } else {
-          await decodeAndQueue(trimmed)
+        stopBargeInMonitor()
+        onPipelineDone(farewell)
+      } catch (e) {
+        if (isStale()) return
+        abortCtrlRef.current = null
+        stopBargeInMonitor()
+        if (!bargingInRef.current) {
+          if (e instanceof DOMException && e.name === 'AbortError') {
+            onPipelineDone(farewell)
+          } else {
+            setError(e instanceof Error ? e.message : 'Voice pipeline failed')
+            onPipelineDone(farewell)
+          }
         }
       }
-
-      const remaining = (nextStartTime - ctx.currentTime) * 1000
-      if (remaining > 0 && callActiveRef.current) {
-        await new Promise<void>((res) => setTimeout(res, remaining + 150))
-      }
-      if (ctx.state !== 'closed') await ctx.close()
-      audioCtxRef.current = null
-
-      // Bot finished naturally — clean up barge-in monitor and continue
-      stopBargeInMonitor()
-      onPipelineDone(farewell)
-    } catch (e) {
-      stopBargeInMonitor()
-      if (!bargingInRef.current) {
-        setError(e instanceof Error ? e.message : 'Voice pipeline failed')
-        onPipelineDone(farewell)
-      }
+    } finally {
+      if (!isStale()) pipelineRunningRef.current = false
     }
   }
 
   // ── Recording ─────────────────────────────────────────────────────────────
 
+  const recordStartRef = useRef<number>(0)
+
   const stopRecording = async () => {
     stopSilenceDetection()
+    clearMaxRecordTimer()
     const recorder = mediaRecorderRef.current
     if (!recorder || recorder.state === 'inactive') return
     recorder.stop()
@@ -401,7 +478,9 @@ export default function App() {
     const mimeType = recorder.mimeType || 'audio/webm'
     const blob = new Blob(audioChunksRef.current, { type: mimeType })
     audioChunksRef.current = []
-    if (blob.size > 0) {
+
+    const elapsed = Date.now() - recordStartRef.current
+    if (blob.size > 0 && elapsed >= MIN_RECORDING_MS) {
       await runPipeline(blob, mimeType)
     } else {
       onPipelineDone()
@@ -422,6 +501,16 @@ export default function App() {
     }
     setError(null)
 
+    // Safety-net: force-stop recording after MAX_RECORDING_MS
+    clearMaxRecordTimer()
+    let stopped = false
+    maxRecordTimerRef.current = setTimeout(() => {
+      if (!stopped) {
+        stopped = true
+        void stopRecording()
+      }
+    }, MAX_RECORDING_MS)
+
     // ── Silence-detection via Web Audio AnalyserNode ─────────────────────
     const silCtx = new AudioContext()
     silenceCtxRef.current = silCtx
@@ -435,7 +524,6 @@ export default function App() {
     let hasSpeech = hasSpeechNow
     let silenceStart: number | null = null
     const recordStart = Date.now()
-    let stopped = false
 
     const checkSilence = () => {
       if (!callActiveRef.current || stopped) return
@@ -452,6 +540,7 @@ export default function App() {
           silenceStart = Date.now()
         } else if (Date.now() - silenceStart > SILENCE_DURATION_MS) {
           stopped = true
+          clearMaxRecordTimer()
           void stopRecording()
           return
         }
@@ -476,6 +565,7 @@ export default function App() {
       if (e.data.size > 0) audioChunksRef.current.push(e.data)
     })
     recorder.start(250)
+    recordStartRef.current = Date.now()
     setPhase('recording')
   }
 
@@ -489,7 +579,9 @@ export default function App() {
 
     let stream: MediaStream
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      })
     } catch (e) {
       setError(
         e instanceof Error && e.name === 'NotAllowedError'
@@ -591,15 +683,19 @@ export default function App() {
   const playWelcomeGreeting = async () => {
     const welcomeText = 'Welcome to Suvit customer support! How can I help you?'
     try {
+      const abortCtrl = new AbortController()
+      abortCtrlRef.current = abortCtrl
       const r = await fetch('/v1/synthesize', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text: welcomeText, language_code: 'en-IN' }),
+        signal: abortCtrl.signal,
       })
       if (!r.ok || !r.body) return
 
       const ctx = new AudioContext()
       audioCtxRef.current = ctx
+      activeSourcesRef.current = []
       let nextStartTime = ctx.currentTime
       setPhase('speaking')
 
@@ -615,9 +711,14 @@ export default function App() {
         const startAt = Math.max(ctx.currentTime, nextStartTime)
         source.start(startAt)
         nextStartTime = startAt + audioBuf.duration
+        activeSourcesRef.current.push(source)
+        source.onended = () => {
+          activeSourcesRef.current = activeSourcesRef.current.filter((s) => s !== source)
+        }
       }
 
       const reader = r.body.getReader()
+      currentReaderRef.current = reader
       const decoder = new TextDecoder()
       let buf = ''
 
@@ -632,16 +733,21 @@ export default function App() {
           if (line.trim()) await decodeAndQueue(line.trim())
         }
       }
+      currentReaderRef.current = null
+      abortCtrlRef.current = null
       if (buf.trim() && callActiveRef.current) await decodeAndQueue(buf.trim())
 
       const remaining = (nextStartTime - ctx.currentTime) * 1000
       if (remaining > 0 && callActiveRef.current) {
         await new Promise<void>((res) => setTimeout(res, remaining + 150))
       }
+      activeSourcesRef.current = []
       if (ctx.state !== 'closed') await ctx.close()
       audioCtxRef.current = null
     } catch {
-      // greeting failed silently — proceed to listening anyway
+      // greeting failed or was aborted — proceed to listening anyway
+      abortCtrlRef.current = null
+      currentReaderRef.current = null
     }
   }
 
@@ -660,9 +766,17 @@ export default function App() {
       callActiveRef.current = false
       bargingInRef.current = false
       stopSilenceDetection()
-      // Cancel any in-flight HTTP reader
+      clearMaxRecordTimer()
+      // Abort any in-flight fetch and cancel reader
+      abortCtrlRef.current?.abort()
+      abortCtrlRef.current = null
       currentReaderRef.current?.cancel().catch(() => {})
       currentReaderRef.current = null
+      // Stop all scheduled audio sources immediately
+      for (const src of activeSourcesRef.current) {
+        try { src.stop() } catch { /* already stopped */ }
+      }
+      activeSourcesRef.current = []
       // Stop barge-in monitor
       if (bargeInFrameRef.current !== null) cancelAnimationFrame(bargeInFrameRef.current)
       bargeInCtxRef.current?.close().catch(() => {})

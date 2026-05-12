@@ -142,6 +142,9 @@ async def synthesize_speech_stream(
     All chunks are fired to Sarvam in parallel. They are yielded in the
     original sentence order so the caller can start playing chunk 1 while
     chunks 2, 3, … are still being synthesized in the background.
+
+    If the consumer stops iterating (e.g. client disconnect / barge-in),
+    remaining tasks are cancelled automatically via the finally block.
     """
     if not api_key:
         raise RuntimeError(
@@ -153,7 +156,6 @@ async def synthesize_speech_stream(
     chunks = _split_into_chunks(clean_text)
     speaker = random.choice(_SPEAKERS)
 
-    # Fire all Sarvam requests at the same time
     tasks = [
         asyncio.ensure_future(
             asyncio.to_thread(_run_sarvam_tts_chunk, chunk, api_key, lang, speaker)
@@ -162,11 +164,22 @@ async def synthesize_speech_stream(
     ]
 
     total_bytes = 0
-    for i, task in enumerate(tasks):
-        wav_bytes = await task
-        total_bytes += len(wav_bytes)
-        logger.info("TTS chunk %d/%d ready [bytes=%d]", i + 1, len(tasks), len(wav_bytes))
-        yield wav_bytes
+    yielded = 0
+    try:
+        for i, task in enumerate(tasks):
+            wav_bytes = await task
+            total_bytes += len(wav_bytes)
+            logger.info("TTS chunk %d/%d ready [bytes=%d]", i + 1, len(tasks), len(wav_bytes))
+            yield wav_bytes
+            yielded += 1
+    finally:
+        cancelled = 0
+        for t in tasks[yielded:]:
+            if not t.done():
+                t.cancel()
+                cancelled += 1
+        if cancelled:
+            logger.info("Cancelled %d remaining TTS tasks (consumer stopped early)", cancelled)
 
     logger.info(
         "TTS stream done [model=%s, speaker=%s, lang=%s, chunks=%d, text_chars=%d, total_bytes=%d]",

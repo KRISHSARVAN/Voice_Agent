@@ -66,6 +66,11 @@ async def transcribe_audio(
             "STT_API_KEY is not set. Add your Sarvam AI API subscription key to .env."
         )
 
+    # WAV header is 44 bytes; anything under 1 KB is too short to contain speech
+    if len(audio_data) < 1024:
+        logger.warning("Audio too short (%d bytes), skipping transcription", len(audio_data))
+        return "", "en-IN"
+        
     ext = _ext_from_content_type(content_type)
     resolved_name = filename or f"recording.{ext}"
 
