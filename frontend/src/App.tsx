@@ -8,6 +8,10 @@ const SILENCE_THRESHOLD = 0.015  // RMS level below which we consider silence
 const SILENCE_DURATION_MS = 1800 // consecutive ms of silence → auto-stop
 const MIN_SPEECH_MS = 400        // don't trigger silence detection in first N ms
 
+// Barge-in detection tuning
+const BARGE_IN_THRESHOLD = 0.025 // RMS level to trigger barge-in (slightly above silence threshold)
+const BARGE_IN_CONFIRM_MS = 250  // ms of continuous speech required to confirm barge-in
+
 // Farewell phrases that should end the call after the bot responds.
 // Also covers common STT mis-transcriptions (e.g. "good buy" for "goodbye").
 const GOODBYE_PATTERNS = [
@@ -29,6 +33,57 @@ const isGoodbye = (text: string) =>
 const isBotFarewell = (text: string) =>
   BOT_GOODBYE_PATTERNS.some((re) => re.test(text))
 
+/**
+ * Convert any audio Blob (e.g. WebM/Opus from MediaRecorder) to a 16-bit
+ * mono 16 kHz WAV Blob that Sarvam Saaras v3 accepts.
+ * Uses the Web Audio API to decode → resample → re-encode as raw PCM WAV.
+ */
+async function blobToWav(blob: Blob): Promise<Blob> {
+  const arrayBuffer = await blob.arrayBuffer()
+  // Decode and resample to 16 kHz in one step
+  const ctx = new AudioContext({ sampleRate: 16000 })
+  let audioBuffer: AudioBuffer
+  try {
+    audioBuffer = await ctx.decodeAudioData(arrayBuffer)
+  } finally {
+    ctx.close().catch(() => {})
+  }
+
+  // Mix down to mono using channel 0
+  const pcm = audioBuffer.getChannelData(0)
+  const numSamples = pcm.length
+  const wavBuffer = new ArrayBuffer(44 + numSamples * 2)
+  const view = new DataView(wavBuffer)
+
+  const writeStr = (offset: number, s: string) => {
+    for (let i = 0; i < s.length; i++) view.setUint8(offset + i, s.charCodeAt(i))
+  }
+
+  const sampleRate = 16000
+  writeStr(0, 'RIFF')
+  view.setUint32(4, 36 + numSamples * 2, true)
+  writeStr(8, 'WAVE')
+  writeStr(12, 'fmt ')
+  view.setUint32(16, 16, true)       // PCM chunk size
+  view.setUint16(20, 1, true)        // PCM format
+  view.setUint16(22, 1, true)        // mono
+  view.setUint32(24, sampleRate, true)
+  view.setUint32(28, sampleRate * 2, true)  // byteRate
+  view.setUint16(32, 2, true)        // blockAlign
+  view.setUint16(34, 16, true)       // bitsPerSample
+  writeStr(36, 'data')
+  view.setUint32(40, numSamples * 2, true)
+
+  let offset = 44
+  for (let i = 0; i < numSamples; i++) {
+    const s = Math.max(-1, Math.min(1, pcm[i]))
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true)
+    offset += 2
+  }
+
+  return new Blob([wavBuffer], { type: 'audio/wav' })
+}
+
 type Phase = 'idle' | 'recording' | 'processing' | 'speaking'
 
 export default function App() {
@@ -49,6 +104,15 @@ export default function App() {
   // Silence-detection resources
   const silenceCtxRef = useRef<AudioContext | null>(null)
   const animFrameRef = useRef<number | null>(null)
+
+  // Barge-in resources
+  const bargeInCtxRef = useRef<AudioContext | null>(null)
+  const bargeInFrameRef = useRef<number | null>(null)
+  const bargeInStreamRef = useRef<MediaStream | null>(null)
+  const bargingInRef = useRef(false)
+
+  // Ref to the active pipeline stream reader so barge-in can cancel it
+  const currentReaderRef = useRef<ReadableStreamDefaultReader<Uint8Array> | null>(null)
 
   useEffect(() => {
     callActiveRef.current = callActive
@@ -77,13 +141,41 @@ export default function App() {
     silenceCtxRef.current = null
   }
 
+  /**
+   * Stop barge-in VAD loop and free its AudioContext.
+   * Pass keepStream=true when the mic stream will be reused for recording.
+   */
+  const stopBargeInMonitor = (keepStream = false) => {
+    if (bargeInFrameRef.current !== null) {
+      cancelAnimationFrame(bargeInFrameRef.current)
+      bargeInFrameRef.current = null
+    }
+    bargeInCtxRef.current?.close().catch(() => {})
+    bargeInCtxRef.current = null
+    if (!keepStream && bargeInStreamRef.current) {
+      bargeInStreamRef.current.getTracks().forEach((t) => t.stop())
+      bargeInStreamRef.current = null
+    }
+  }
+
+  /** Cancel the active HTTP stream reader and stop audio playback. */
+  const cancelCurrentPlayback = () => {
+    if (currentReaderRef.current) {
+      currentReaderRef.current.cancel().catch(() => {})
+      currentReaderRef.current = null
+    }
+    stopAudio()
+  }
+
   // ── Call lifecycle ────────────────────────────────────────────────────────
 
   const endCall = () => {
     callActiveRef.current = false
     setCallActive(false)
-    stopAudio()
+    bargingInRef.current = false
+    cancelCurrentPlayback()
     stopSilenceDetection()
+    stopBargeInMonitor()
     if (
       mediaRecorderRef.current &&
       mediaRecorderRef.current.state !== 'inactive'
@@ -127,13 +219,19 @@ export default function App() {
     let detectedLang = 'en-IN'
     let farewell = false
     try {
+      // Sarvam Saaras v3 does not accept WebM/Opus. Convert to 16 kHz mono WAV first.
+      let uploadBlob: Blob = blob
+      let uploadName = 'recording.wav'
+      try {
+        uploadBlob = await blobToWav(blob)
+      } catch {
+        // Conversion failed (unlikely) — fall back to raw blob with original extension
+        const ext = mimeType.includes('ogg') ? 'ogg' : mimeType.includes('mp4') ? 'mp4' : 'webm'
+        uploadName = `recording.${ext}`
+        uploadBlob = blob
+      }
       const form = new FormData()
-      const ext = mimeType.includes('ogg')
-        ? 'ogg'
-        : mimeType.includes('mp4')
-          ? 'mp4'
-          : 'webm'
-      form.append('file', blob, `recording.${ext}`)
+      form.append('file', uploadBlob, uploadName)
       const r = await fetch('/v1/transcribe', { method: 'POST', body: form })
       const data = (await r.json().catch(() => ({}))) as {
         text?: string
@@ -187,6 +285,9 @@ export default function App() {
       let nextStartTime = ctx.currentTime
       setPhase('speaking')
 
+      // Start monitoring for barge-in as soon as bot audio begins
+      void startBargeInMonitor()
+
       const decodeAndQueue = async (b64line: string): Promise<void> => {
         const binary = atob(b64line)
         const bytes = new Uint8Array(binary.length)
@@ -202,14 +303,17 @@ export default function App() {
       }
 
       const reader = r.body.getReader()
+      currentReaderRef.current = reader
       const decoder = new TextDecoder()
       let buf = ''
 
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
-        if (!callActiveRef.current) {
+        // Stop if call ended OR user barged in
+        if (!callActiveRef.current || bargingInRef.current) {
           reader.cancel().catch(() => {})
+          currentReaderRef.current = null
           break
         }
         buf += decoder.decode(value, { stream: true })
@@ -234,6 +338,18 @@ export default function App() {
           }
         }
       }
+
+      currentReaderRef.current = null
+
+      // If user interrupted, skip the remaining audio wait and return — 
+      // handleBargeIn already switched phase to 'recording'
+      if (bargingInRef.current) {
+        if (ctx.state !== 'closed') ctx.close().catch(() => {})
+        audioCtxRef.current = null
+        stopBargeInMonitor()
+        return
+      }
+
       // Process any remaining buffered content.
       if (buf.trim() && callActiveRef.current) {
         const trimmed = buf.trim()
@@ -259,10 +375,15 @@ export default function App() {
       if (ctx.state !== 'closed') await ctx.close()
       audioCtxRef.current = null
 
+      // Bot finished naturally — clean up barge-in monitor and continue
+      stopBargeInMonitor()
       onPipelineDone(farewell)
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Voice pipeline failed')
-      onPipelineDone(farewell)
+      stopBargeInMonitor()
+      if (!bargingInRef.current) {
+        setError(e instanceof Error ? e.message : 'Voice pipeline failed')
+        onPipelineDone(farewell)
+      }
     }
   }
 
@@ -288,28 +409,18 @@ export default function App() {
   }
 
   /**
-   * Start microphone recording with automatic silence detection.
-   * When silence is detected after the user speaks, recording stops and
-   * the pipeline is triggered automatically.
+   * Core recording function. Accepts an already-opened MediaStream so barge-in
+   * can hand off its mic stream without re-prompting for permission.
+   * @param stream       Live mic MediaStream to record from.
+   * @param hasSpeechNow Pass true when the user is already speaking (barge-in case)
+   *                     so silence detection doesn't wait for the first utterance.
    */
-  const startListening = async () => {
-    if (!callActiveRef.current) return
-    setError(null)
-
-    let stream: MediaStream
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-    } catch (e) {
-      setError(
-        e instanceof Error && e.name === 'NotAllowedError'
-          ? 'Microphone access denied. Please allow microphone permission.'
-          : e instanceof Error
-            ? e.message
-            : 'Could not access microphone',
-      )
-      endCall()
+  const startListeningWithStream = (stream: MediaStream, hasSpeechNow = false) => {
+    if (!callActiveRef.current) {
+      stream.getTracks().forEach((t) => t.stop())
       return
     }
+    setError(null)
 
     // ── Silence-detection via Web Audio AnalyserNode ─────────────────────
     const silCtx = new AudioContext()
@@ -321,7 +432,7 @@ export default function App() {
 
     const bufLen = analyser.frequencyBinCount
     const data = new Float32Array(bufLen)
-    let hasSpeech = false
+    let hasSpeech = hasSpeechNow
     let silenceStart: number | null = null
     const recordStart = Date.now()
     let stopped = false
@@ -366,6 +477,113 @@ export default function App() {
     })
     recorder.start(250)
     setPhase('recording')
+  }
+
+  /**
+   * Start microphone recording with automatic silence detection.
+   * When silence is detected after the user speaks, recording stops and
+   * the pipeline is triggered automatically.
+   */
+  const startListening = async () => {
+    if (!callActiveRef.current) return
+
+    let stream: MediaStream
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+    } catch (e) {
+      setError(
+        e instanceof Error && e.name === 'NotAllowedError'
+          ? 'Microphone access denied. Please allow microphone permission.'
+          : e instanceof Error
+            ? e.message
+            : 'Could not access microphone',
+      )
+      endCall()
+      return
+    }
+
+    startListeningWithStream(stream)
+  }
+
+  // ── Barge-in (interrupt bot while it is speaking) ─────────────────────────
+
+  /**
+   * Triggered when the barge-in VAD confirms the user is speaking.
+   * Cancels the current bot response, hands the open mic stream to the
+   * normal recording path, and starts listening immediately.
+   */
+  const handleBargeIn = () => {
+    if (!callActiveRef.current) return
+    const stream = bargeInStreamRef.current
+    if (!stream) return
+
+    // Stop bot playback and HTTP stream
+    cancelCurrentPlayback()
+
+    // Stop barge-in VAD loop but keep the mic stream open for recording
+    stopBargeInMonitor(/* keepStream= */ true)
+    bargeInStreamRef.current = null
+
+    // Start recording — user is already speaking, so skip initial silence wait
+    startListeningWithStream(stream, /* hasSpeechNow= */ true)
+  }
+
+  /**
+   * Open a background mic listener that watches for barge-in while the bot
+   * is speaking.  Stops automatically once barge-in is confirmed or the
+   * speaking phase ends (stopBargeInMonitor called externally).
+   */
+  const startBargeInMonitor = async () => {
+    if (!callActiveRef.current) return
+    bargingInRef.current = false
+
+    let stream: MediaStream
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true },
+      })
+    } catch {
+      return // Mic unavailable — barge-in simply won't work this turn
+    }
+
+    if (!callActiveRef.current) {
+      stream.getTracks().forEach((t) => t.stop())
+      return
+    }
+
+    bargeInStreamRef.current = stream
+
+    const ctx = new AudioContext()
+    bargeInCtxRef.current = ctx
+    const micSource = ctx.createMediaStreamSource(stream)
+    const analyser = ctx.createAnalyser()
+    analyser.fftSize = 512
+    micSource.connect(analyser)
+
+    const bufLen = analyser.frequencyBinCount
+    const data = new Float32Array(bufLen)
+    let speechStart: number | null = null
+
+    const check = () => {
+      if (!callActiveRef.current || bargingInRef.current) return
+      analyser.getFloatTimeDomainData(data)
+      const rms = Math.sqrt(data.reduce((s, v) => s + v * v, 0) / bufLen)
+
+      if (rms > BARGE_IN_THRESHOLD) {
+        if (speechStart === null) speechStart = Date.now()
+        else if (Date.now() - speechStart >= BARGE_IN_CONFIRM_MS) {
+          // Confirmed — set flag first so the loop stops re-entering
+          bargingInRef.current = true
+          handleBargeIn()
+          return
+        }
+      } else {
+        speechStart = null
+      }
+
+      bargeInFrameRef.current = requestAnimationFrame(check)
+    }
+    bargeInFrameRef.current = requestAnimationFrame(check)
   }
 
   // ── Begin Call ────────────────────────────────────────────────────────────
@@ -440,7 +658,15 @@ export default function App() {
   useEffect(() => {
     return () => {
       callActiveRef.current = false
+      bargingInRef.current = false
       stopSilenceDetection()
+      // Cancel any in-flight HTTP reader
+      currentReaderRef.current?.cancel().catch(() => {})
+      currentReaderRef.current = null
+      // Stop barge-in monitor
+      if (bargeInFrameRef.current !== null) cancelAnimationFrame(bargeInFrameRef.current)
+      bargeInCtxRef.current?.close().catch(() => {})
+      bargeInStreamRef.current?.getTracks().forEach((t) => t.stop())
       if (
         mediaRecorderRef.current &&
         mediaRecorderRef.current.state !== 'inactive'
@@ -458,7 +684,7 @@ export default function App() {
     idle: 'Ready',
     recording: 'Listening…',
     processing: 'Processing…',
-    speaking: 'Agent Speaking…',
+    speaking: 'Agent Speaking… (speak to interrupt)',
   }
 
   const statusTone = callActive
