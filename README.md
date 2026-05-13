@@ -7,7 +7,7 @@ A real-time voice-enabled RAG (Retrieval-Augmented Generation) chatbot for [Suvi
 ## Architecture
 
 ```
-Browser (React + Vite)
+Browser 
   │
   │  WebSocket  /ws/voice  (persistent; full-duplex during a call)
   │     │
@@ -155,15 +155,15 @@ OPENAI_API_KEY=sk-...
 STT_API_KEY=your-sarvam-key
 TTS_API_KEY=your-sarvam-key
 
-MONGODB_URI=mongodb://localhost:27017
-MONGODB_DB=suvit_voice
-MONGODB_CHAT_COLLECTION=chat_turns
+MONGODB_URI=
+MONGODB_DB=
+MONGODB_CHAT_COLLECTION=
 
-CHROMA_PERSIST_DIRECTORY=./chroma_db
-CHROMA_COLLECTION_NAME=suvit_help
+CHROMA_PERSIST_DIRECTORY=
+CHROMA_COLLECTION_NAME=
 
 ENVIRONMENT=development
-CORS_ORIGINS_RAW=http://localhost:5173
+CORS_ORIGINS_RAW=
 ```
 
 ### 4. Ingest the help articles (one-time)
@@ -245,10 +245,12 @@ Response shape: `answer`, `sources` (list of excerpts and metadata when enabled)
 
 ## Supported languages
 
+
 | Language        | Code    |
 | --------------- | ------- |
 | English (India) | `en-IN` |
 | Hindi           | `hi-IN` |
+
 
 The STT model auto-detects the spoken language. For Hindi and Gujarati, the RAG layer translates the query to English for retrieval, then instructs the LLM to answer in the user's language.
 
@@ -270,3 +272,4 @@ The STT model auto-detects the spoken language. For Hindi and Gujarati, the RAG 
 - TTS sentences are synthesised **in parallel** and yielded in order to reduce perceived latency.
 - MongoDB indexes are ensured on startup via `ensure_chat_indexes`.
 - Set `ENVIRONMENT=development` to surface full error `detail` in some 5xx paths and to enable DEBUG logging.
+
