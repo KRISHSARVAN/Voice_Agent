@@ -1,6 +1,6 @@
 # Suvit Voice Agent
 
-A real-time voice-enabled RAG (Retrieval-Augmented Generation) chatbot for [Suvit](https://suvit.io) customer support. Users can speak questions about Suvit's accounting automation platform and receive answers — spoken aloud in Indian languages — backed by content scraped from [help.suvit.io](https://help.suvit.io).
+A real-time voice-enabled RAG (Retrieval-Augmented Generation) chatbot for [Suvit](https://suvit.io) customer support. Users can speak questions about Suvit's accounting automation platform and receive answers - spoken aloud in Indian languages - backed by content scraped from [help.suvit.io](https://help.suvit.io).
 
 ---
 
