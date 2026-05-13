@@ -278,6 +278,46 @@
   border-color: #9ca3af;
 }
 
+/* ── User transcript bubble (STT) ───────────────────────────────────────── */
+
+.transcript-bubble {
+  margin-top: 0.75rem;
+  padding: 0.65rem 0.9rem;
+  border-radius: 14px;
+  font-size: 0.875rem;
+  line-height: 1.5;
+  max-height: 7rem;
+  overflow-y: auto;
+  text-align: left;
+  animation: fadeSlideIn 0.18s ease;
+}
+
+.transcript-bubble.user {
+  background: #f0f4ff;
+  border: 1px solid #c7d7fd;
+  color: #1e3a8a;
+}
+
+.bubble-label {
+  display: block;
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  opacity: 0.6;
+  margin-bottom: 0.2rem;
+}
+
+.transcript-bubble p {
+  margin: 0;
+  word-break: break-word;
+}
+
+@keyframes fadeSlideIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0);   }
+}
+
 @media (max-width: 640px) {
   .voice-card {
     border-radius: 22px;

@@ -6,7 +6,6 @@ import asyncio
 import base64
 import io
 import logging
-import random
 import re
 import wave
 from typing import AsyncIterator
@@ -18,14 +17,26 @@ TTS_DEFAULT_LANGUAGE = "en-IN"
 _SUPPORTED_LANGUAGES = {"en-IN", "gu-IN", "hi-IN"}
 _MAX_CHUNK_CHARS = 500  # Sarvam TTS per-request character limit
 
-# All speakers supported by bulbul:v3
-_SPEAKERS = [
-    "aditya", "ritu", "ashutosh", "priya", "neha", "rahul", "pooja", "rohan",
-    "simran", "kavya", "amit", "dev", "ishita", "shreya", "ratan", "varun",
-    "manan", "sumit", "roopa", "kabir", "aayan", "shubh", "advait", "anand",
-    "tanya", "tarun", "sunny", "mani", "gokul", "vijay", "shruti", "suhani",
-    "mohit", "kavitha", "rehan", "soham", "rupali",
-]
+_ALL_SPEAKER_NAMES = frozenset(
+    {
+        "aditya", "ritu", "ashutosh", "priya", "neha", "rahul", "pooja", "rohan",
+        "simran", "kavya", "amit", "dev", "ishita", "shreya", "ratan", "varun",
+        "manan", "sumit", "roopa", "kabir", "aayan", "shubh", "advait", "anand",
+        "tanya", "tarun", "sunny", "mani", "gokul", "vijay", "shruti", "suhani",
+        "mohit", "kavitha", "rehan", "soham", "rupali",
+    }
+)
+
+DEFAULT_VOICE_SPEAKER = "priya"
+
+
+def _resolve_speaker(speaker: str | None) -> str:
+    """Single consistent voice unless an explicit Bulbul speaker name is passed."""
+    if speaker:
+        key = speaker.strip().lower()
+        if key in _ALL_SPEAKER_NAMES:
+            return key
+    return DEFAULT_VOICE_SPEAKER
 
 
 def _strip_markdown(text: str) -> str:
@@ -105,11 +116,6 @@ def _run_sarvam_tts_chunk(text: str, api_key: str, language_code: str, speaker: 
     return base64.b64decode(result.audios[0])
 
 
-def pick_speaker() -> str:
-    """Return a random speaker name for a TTS session."""
-    return random.choice(_SPEAKERS)
-
-
 async def synthesize_chunk(
     text: str,
     api_key: str,
@@ -118,7 +124,7 @@ async def synthesize_chunk(
 ) -> bytes:
     """Synthesize a single text chunk asynchronously and return WAV bytes."""
     lang = language_code if language_code in _SUPPORTED_LANGUAGES else TTS_DEFAULT_LANGUAGE
-    spk = speaker or random.choice(_SPEAKERS)
+    spk = _resolve_speaker(speaker)
     return await asyncio.to_thread(_run_sarvam_tts_chunk, text, api_key, lang, spk)
 
 
@@ -136,6 +142,7 @@ async def synthesize_speech_stream(
     text: str,
     api_key: str,
     language_code: str = TTS_DEFAULT_LANGUAGE,
+    speaker: str | None = None,
 ) -> AsyncIterator[bytes]:
     """Synthesize speech and yield WAV chunks as they become ready (in text order).
 
@@ -154,11 +161,11 @@ async def synthesize_speech_stream(
     lang = language_code if language_code in _SUPPORTED_LANGUAGES else TTS_DEFAULT_LANGUAGE
     clean_text = _strip_markdown(text)
     chunks = _split_into_chunks(clean_text)
-    speaker = random.choice(_SPEAKERS)
+    spk = _resolve_speaker(speaker)
 
     tasks = [
         asyncio.ensure_future(
-            asyncio.to_thread(_run_sarvam_tts_chunk, chunk, api_key, lang, speaker)
+            asyncio.to_thread(_run_sarvam_tts_chunk, chunk, api_key, lang, spk)
         )
         for chunk in chunks
     ]
@@ -183,5 +190,5 @@ async def synthesize_speech_stream(
 
     logger.info(
         "TTS stream done [model=%s, speaker=%s, lang=%s, chunks=%d, text_chars=%d, total_bytes=%d]",
-        TTS_MODEL, speaker, lang, len(chunks), len(clean_text), total_bytes,
+        TTS_MODEL, spk, lang, len(chunks), len(clean_text), total_bytes,
     )

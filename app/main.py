@@ -8,17 +8,14 @@ Run (from repo root, venv activated):
 from __future__ import annotations
 
 import asyncio
-import base64
-import json
 import logging
-import re
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import Body, FastAPI, File, HTTPException, Request, UploadFile, status
+from fastapi import FastAPI, HTTPException, Request, WebSocket, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse
 from langchain_chroma import Chroma
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -26,10 +23,9 @@ from motor.motor_asyncio import AsyncIOMotorClient
 
 from app.config import Settings, get_settings
 from app.db import ensure_chat_indexes, insert_chat_turn, list_turns_for_session
-from app.rag_service import astream_rag_chat, run_rag_chat
+from app.rag_service import run_rag_chat
 from app.schemas import ChatRequest, ChatResponse, ConversationTurn, SourceChunk
-from app.stt_service import transcribe_audio
-from app.tts_service import pick_speaker, synthesize_chunk, synthesize_speech_stream, _strip_markdown
+from app.ws_voice import handle_ws_voice
 from rag.embeddings import build_embeddings
 
 logger = logging.getLogger(__name__)
@@ -129,6 +125,16 @@ def create_app() -> FastAPI:
             content={"detail": msg, "request_id": req_id},
         )
 
+    @app.websocket("/ws/voice")
+    async def ws_voice(websocket: WebSocket):
+        """Persistent WebSocket voice pipeline.
+
+        Replaces per-turn HTTP POST + StreamingResponse with a single long-lived
+        connection: binary WAV frames for audio (no base64), JSON frames for LLM
+        tokens and metadata, and instant interrupt support.
+        """
+        await handle_ws_voice(websocket)
+
     @app.get("/health", tags=["ops"])
     async def health():
         return {"status": "ok"}
@@ -225,205 +231,6 @@ def create_app() -> FastAPI:
             )
             for r in rows
         ]
-
-    @app.post("/v1/transcribe", tags=["stt"])
-    async def transcribe(request: Request, file: UploadFile = File(...)):
-        """Accept an audio file and return its transcription via Sarvam AI Saaras v3."""
-        settings: Settings = request.app.state.settings
-        audio_data = await file.read()
-        if not audio_data:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Uploaded audio file is empty.",
-            )
-        try:
-            text, language_code = await transcribe_audio(
-                audio_data,
-                api_key=settings.stt_api_key,
-                content_type=file.content_type,
-                filename=file.filename,
-            )
-        except Exception as e:
-            logger.exception("Transcription failed")
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=str(e) if settings.environment == "development" else "Transcription failed",
-            ) from e
-        return {"text": text, "language_code": language_code}
-
-    @app.post("/v1/synthesize", tags=["tts"])
-    async def synthesize(
-        request: Request,
-        text: str = Body(..., embed=True),
-        language_code: str = Body("en-IN", embed=True),
-    ):
-        """Convert text to speech using Sarvam AI Bulbul v3.
-
-        Returns a newline-delimited stream of base64-encoded WAV chunks.
-        Chunks are synthesized in parallel and streamed in sentence order so
-        the client can start playing the first chunk while the rest arrive.
-        """
-        settings: Settings = request.app.state.settings
-        if not text or not text.strip():
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="text must not be empty.",
-            )
-
-        async def audio_stream():
-            try:
-                async for wav_chunk in synthesize_speech_stream(
-                    text.strip(),
-                    api_key=settings.tts_api_key,
-                    language_code=language_code,
-                ):
-                    if await request.is_disconnected():
-                        logger.info("Client disconnected during TTS synthesis, stopping")
-                        return
-                    yield base64.b64encode(wav_chunk) + b"\n"
-            except Exception:
-                logger.exception("TTS synthesis failed mid-stream")
-
-        return StreamingResponse(audio_stream(), media_type="text/plain")
-
-    @app.post("/v1/voice", tags=["voice"])
-    async def voice_pipeline(request: Request, body: ChatRequest):
-        """Real-time voice pipeline: LLM streams tokens → sentences fire TTS immediately.
-
-        Response: newline-delimited stream where most lines are base64 WAV audio chunks
-        and the final line is a JSON metadata object prefixed with ``data:``.
-        The metadata line carries ``session_id`` and ``answer`` so the client can
-        update its session and detect farewell phrases without a second request.
-        """
-        settings: Settings = request.app.state.settings
-        vs = request.app.state.vectorstore
-        mongo_coll = request.app.state.mongo_collection
-        session_id = body.session_id or str(uuid.uuid4())
-        user_text = body.messages[-1].content
-
-        if not settings.tts_api_key:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="TTS is not configured on this server.",
-            )
-
-        pairs_out: list = []
-        answer_parts: list[str] = []
-
-        _sentence_re = re.compile(r'(?<=[.!?।])\s+')
-
-        async def audio_stream():
-            speaker = pick_speaker()
-            sentence_buf = ""
-            tts_tasks: list[asyncio.Task] = []
-            yielded_count = 0
-            interrupted = False
-
-            async def _is_disconnected() -> bool:
-                return await request.is_disconnected()
-
-            async def _cancel_remaining_tasks(tasks: list[asyncio.Task], from_idx: int) -> None:
-                """Cancel all pending TTS tasks from from_idx onwards."""
-                for t in tasks[from_idx:]:
-                    if not t.done():
-                        t.cancel()
-                for t in tasks[from_idx:]:
-                    if not t.done():
-                        try:
-                            await t
-                        except (asyncio.CancelledError, Exception):
-                            pass
-
-            async def _queue_tts(text: str) -> None:
-                clean = _strip_markdown(text).strip()
-                if clean:
-                    task = asyncio.ensure_future(
-                        synthesize_chunk(clean, settings.tts_api_key, body.language_code, speaker)
-                    )
-                    tts_tasks.append(task)
-
-            try:
-                async for token in astream_rag_chat(
-                    vectorstore=vs,
-                    settings=settings,
-                    messages=[(m.role, m.content) for m in body.messages],
-                    top_k=body.top_k,
-                    language_code=body.language_code,
-                    pairs_out=pairs_out,
-                ):
-                    if await _is_disconnected():
-                        logger.info("Client disconnected during LLM stream, aborting voice pipeline")
-                        interrupted = True
-                        break
-
-                    answer_parts.append(token)
-                    sentence_buf += token
-
-                    parts = _sentence_re.split(sentence_buf)
-                    if len(parts) > 1:
-                        for sentence in parts[:-1]:
-                            await _queue_tts(sentence)
-                        sentence_buf = parts[-1]
-
-                    while yielded_count < len(tts_tasks) and tts_tasks[yielded_count].done():
-                        try:
-                            wav = tts_tasks[yielded_count].result()
-                            yield base64.b64encode(wav) + b"\n"
-                        except Exception:
-                            logger.exception("TTS chunk %d failed, skipping", yielded_count)
-                        yielded_count += 1
-
-            except Exception:
-                logger.exception("LLM streaming failed in voice pipeline")
-
-            if interrupted:
-                await _cancel_remaining_tasks(tts_tasks, yielded_count)
-                logger.info("Voice pipeline aborted — cancelled %d pending TTS tasks",
-                            len(tts_tasks) - yielded_count)
-                return
-
-            # Flush the final sentence fragment (no trailing punctuation).
-            if sentence_buf.strip():
-                await _queue_tts(sentence_buf)
-
-            # Await and yield remaining TTS tasks in order.
-            for i in range(yielded_count, len(tts_tasks)):
-                if await _is_disconnected():
-                    logger.info("Client disconnected during TTS delivery, cancelling remaining")
-                    await _cancel_remaining_tasks(tts_tasks, i)
-                    return
-                try:
-                    wav = await tts_tasks[i]
-                    yield base64.b64encode(wav) + b"\n"
-                except asyncio.CancelledError:
-                    logger.info("TTS chunk %d cancelled", i)
-                except Exception:
-                    logger.exception("TTS chunk %d failed, skipping", i)
-
-            # Final metadata line so the client gets session_id + answer text.
-            full_answer = "".join(answer_parts)
-            meta = json.dumps({"session_id": session_id, "answer": full_answer})
-            yield b"data:" + meta.encode() + b"\n"
-
-            # Persist to MongoDB after all audio is sent.
-            try:
-                await insert_chat_turn(
-                    mongo_coll,
-                    session_id=session_id,
-                    user_text=user_text,
-                    bot_response=full_answer,
-                )
-            except Exception:
-                logger.exception("Failed to persist voice turn session_id=%s", session_id)
-
-            print(f"\n[USER]  {user_text}")
-            print(f"[BOT]   {full_answer}\n", flush=True)
-
-        return StreamingResponse(
-            audio_stream(),
-            media_type="text/plain",
-            headers={"X-Session-Id": session_id},
-        )
 
     return app
 

@@ -9,29 +9,28 @@ A real-time voice-enabled RAG (Retrieval-Augmented Generation) chatbot for [Suvi
 ```
 Browser (React + Vite)
   │
-  │  WebM audio  ──►  POST /v1/voice  ──►  Sarvam Saaras v3 (STT)
-  │                        │
-  │                        ▼
-  │               ChromaDB vector search  (BAAI/bge-small-en-v1.5, configurable)
-  │                        │
-  │                        ▼
-  │                  OpenAI GPT-4o-mini  (streaming tokens)
-  │                        │
-  │                        ▼
-  │  base64 WAV  ◄──  Sarvam Bulbul v3 (TTS, parallel sentence synthesis)
+  │  WebSocket  /ws/voice  (persistent; full-duplex during a call)
+  │     │
+  │     ├─►  JSON: transcribe (base64 WAV) ──► Sarvam Saaras v3 (STT)
+  │     ├─►  JSON: synthesize (welcome / short TTS) ──► binary WAV frames
+  │     └─►  JSON: query (user text) ──┬──► ChromaDB vector search
+  │                                    ├──► OpenAI (streaming tokens → client)
+  │                                    └──► Sarvam Bulbul v3 (TTS) → binary WAV
   │
   └── Chat history persisted in MongoDB
 ```
 
 **Key services**
 
-| Service | Model | Role |
-|---|---|---|
-| Speech-to-Text | Sarvam Saaras v3 | Transcribes microphone audio; detects language |
-| LLM | OpenAI GPT-4o-mini (default) | Generates answers from retrieved context |
-| Text-to-Speech | Sarvam Bulbul v3 | Synthesises spoken responses in Indian languages |
-| Vector DB | ChromaDB | Stores and retrieves help article chunks |
-| Chat history | MongoDB | Persists user/bot turns per session |
+
+| Service        | Model                        | Role                                             |
+| -------------- | ---------------------------- | ------------------------------------------------ |
+| Speech-to-Text | Sarvam Saaras v3             | Transcribes microphone audio; detects language   |
+| LLM            | OpenAI GPT-4o-mini (default) | Generates answers from retrieved context         |
+| Text-to-Speech | Sarvam Bulbul v3             | Synthesises spoken responses in Indian languages |
+| Vector DB      | ChromaDB                     | Stores and retrieves help article chunks         |
+| Chat history   | MongoDB                      | Persists user/bot turns per session              |
+
 
 ---
 
@@ -46,7 +45,8 @@ Voice_agent/
 │   ├── stt_service.py    # Sarvam Saaras v3 speech-to-text
 │   ├── tts_service.py    # Sarvam Bulbul v3 text-to-speech
 │   ├── db.py             # MongoDB helpers
-│   └── schemas.py        # Pydantic request/response models
+│   ├── schemas.py        # Pydantic request/response models
+│   └── ws_voice.py       # WebSocket protocol: STT, TTS, RAG + streaming replies
 ├── rag/
 │   ├── embeddings.py     # HuggingFace embedding builder
 │   └── store_config.py   # ChromaDB path / collection constants
@@ -99,44 +99,54 @@ Create a `.env` file at the project root. Pydantic loads these names (case-insen
 
 **Required**
 
-| Variable | Description |
-|---|---|
+
+| Variable         | Description                       |
+| ---------------- | --------------------------------- |
 | `OPENAI_API_KEY` | OpenAI API key for the chat model |
+
 
 **Strongly recommended for full functionality**
 
-| Variable | Default | Description |
-|---|---|---|
-| `STT_API_KEY` | _(empty)_ | Sarvam key for `/v1/transcribe` and client-side STT flows |
-| `TTS_API_KEY` | _(empty)_ | Sarvam key for `/v1/synthesize` and `/v1/voice` (voice returns 503 if missing) |
-| `CORS_ORIGINS_RAW` | _(empty)_ | Comma-separated browser origins; if empty, CORS middleware is not added |
+
+| Variable           | Default   | Description                                                                        |
+| ------------------ | --------- | ---------------------------------------------------------------------------------- |
+| `STT_API_KEY`      | *(empty)* | Sarvam key used by the WebSocket transcribe path (`/ws/voice`)                     |
+| `TTS_API_KEY`      | *(empty)* | Sarvam key for WebSocket synthesize and query TTS (voice returns error if missing) |
+| `CORS_ORIGINS_RAW` | *(empty)* | Comma-separated browser origins; if empty, CORS middleware is not added            |
+
 
 **Database and vector store**
 
-| Variable | Default | Description |
-|---|---|---|
-| `MONGODB_URI` | `mongodb://localhost:27017` | MongoDB connection URI |
-| `MONGODB_DB` | `suvit_voice` | Database name |
-| `MONGODB_CHAT_COLLECTION` | `chat_turns` | Collection for chat turns |
-| `CHROMA_PERSIST_DIRECTORY` | `./chroma_db` | Chroma persist path (must match ingest) |
-| `CHROMA_COLLECTION_NAME` | `suvit_help` | Collection name (must match ingest) |
-| `EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | Sentence-transformers model; **must match** what you used when running the ingest script |
+
+| Variable                   | Default                     | Description                                                                              |
+| -------------------------- | --------------------------- | ---------------------------------------------------------------------------------------- |
+| `MONGODB_URI`              | `mongodb://localhost:27017` | MongoDB connection URI                                                                   |
+| `MONGODB_DB`               | `suvit_voice`               | Database name                                                                            |
+| `MONGODB_CHAT_COLLECTION`  | `chat_turns`                | Collection for chat turns                                                                |
+| `CHROMA_PERSIST_DIRECTORY` | `./chroma_db`               | Chroma persist path (must match ingest)                                                  |
+| `CHROMA_COLLECTION_NAME`   | `suvit_help`                | Collection name (must match ingest)                                                      |
+| `EMBED_MODEL`              | `BAAI/bge-small-en-v1.5`    | Sentence-transformers model; **must match** what you used when running the ingest script |
+
 
 **OpenAI and RAG tuning**
 
-| Variable | Default | Description |
-|---|---|---|
-| `OPENAI_MODEL` | `gpt-4o-mini` | Chat completion model |
-| `OPENAI_TEMPERATURE` | `0.1` | Sampling temperature |
-| `OPENAI_TIMEOUT_S` | `120` | Request timeout (seconds) |
-| `RAG_TOP_K` | `6` | Default retrieval `k` when the client omits `top_k` |
-| `RAG_MAX_CONTEXT_CHARS` | `12000` | Cap on context size passed to the model |
+
+| Variable                | Default       | Description                                         |
+| ----------------------- | ------------- | --------------------------------------------------- |
+| `OPENAI_MODEL`          | `gpt-4o-mini` | Chat completion model                               |
+| `OPENAI_TEMPERATURE`    | `0.1`         | Sampling temperature                                |
+| `OPENAI_TIMEOUT_S`      | `120`         | Request timeout (seconds)                           |
+| `RAG_TOP_K`             | `6`           | Default retrieval `k` when the client omits `top_k` |
+| `RAG_MAX_CONTEXT_CHARS` | `12000`       | Cap on context size passed to the model             |
+
 
 **App**
 
-| Variable | Default | Description |
-|---|---|---|
+
+| Variable      | Default       | Description                                         |
+| ------------- | ------------- | --------------------------------------------------- |
 | `ENVIRONMENT` | `development` | Use `development` for verbose errors and DEBUG logs |
+
 
 Minimal example:
 
@@ -202,10 +212,12 @@ Open [http://localhost:5173](http://localhost:5173) in your browser.
 
 ### Health and readiness
 
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/health` | Returns `{"status":"ok"}` |
-| `GET` | `/ready` | Returns `{"status":"ready","chunk_count":N}`; **503** if Chroma is missing, broken, or empty |
+
+| Method | Path      | Description                                                                                  |
+| ------ | --------- | -------------------------------------------------------------------------------------------- |
+| `GET`  | `/health` | Returns `{"status":"ok"}`                                                                    |
+| `GET`  | `/ready`  | Returns `{"status":"ready","chunk_count":N}`; **503** if Chroma is missing, broken, or empty |
+
 
 ### Chat (text)
 
@@ -225,58 +237,18 @@ The **last** message in `messages` must have `role: "user"`. Omitting `top_k` us
 }
 ```
 
-`include_sources` defaults to **`true`** in the API schema; set it to `false` if you do not need `sources` in the response.
+`include_sources` defaults to `**true**` in the API schema; set it to `false` if you do not need `sources` in the response.
 
 Response shape: `answer`, `sources` (list of excerpts and metadata when enabled), `session_id`.
-
-### Speech-to-text
-
-`POST /v1/transcribe`  
-`Content-Type: multipart/form-data` — field name `file` (audio bytes).
-
-Supported content types include `audio/webm`, `audio/wav`, `audio/mpeg`, and others mapped in `app/stt_service.py`.
-
-Returns:
-
-```json
-{"text": "…", "language_code": "hi-IN"}
-```
-
-### Text-to-speech
-
-`POST /v1/synthesize`
-
-```json
-{"text": "Hello!", "language_code": "en-IN"}
-```
-
-Returns a newline-delimited stream of base64-encoded WAV lines (`text/plain`).
-
-### Voice pipeline (STT + RAG + TTS in one call)
-
-`POST /v1/voice`
-
-Same JSON body as `/v1/chat` (typically the last user turn is text already transcribed on the client). Requires `TTS_API_KEY`.
-
-Response: newline-delimited stream — most lines are base64 WAV chunks; the **final** line is `data:` + JSON with `session_id` and full `answer` text.
-
-Response header: **`X-Session-Id`** — session id for this turn (also in the final `data:` line).
-
-### Chat history
-
-`GET /v1/sessions/{session_id}/turns?limit=200`
-
-Returns stored user/bot turns for the session.
 
 ---
 
 ## Supported languages
 
-| Language | Code |
-|---|---|
+| Language        | Code    |
+| --------------- | ------- |
 | English (India) | `en-IN` |
-| Hindi | `hi-IN` |
-| Gujarati | `gu-IN` |
+| Hindi           | `hi-IN` |
 
 The STT model auto-detects the spoken language. For Hindi and Gujarati, the RAG layer translates the query to English for retrieval, then instructs the LLM to answer in the user's language.
 
