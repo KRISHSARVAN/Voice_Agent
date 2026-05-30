@@ -19,11 +19,9 @@ build/
 pip-log.txt
 pip-delete-this-directory.txt
 
-# ── Secrets & credentials (NEVER commit these) ───────────────────────────────
+# ── Secrets & credentials ─────────────────────────────
 .env
 .env.*
-!.env.example
-!.env.template
 *.key
 *.pem
 *.p12
@@ -43,8 +41,6 @@ firebase*.json
 # ── Local stores ─────────────────────────────────────────────────────────────
 chroma_db/
 *.db
-*.sqlite
-*.sqlite3
 
 # ── Frontend ──────────────────────────────────────────────────────────────────
 frontend/node_modules/
