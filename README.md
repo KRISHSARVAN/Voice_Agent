@@ -212,36 +212,11 @@ Open [http://localhost:5173](http://localhost:5173) in your browser.
 
 ### Health and readiness
 
-
 | Method | Path      | Description                                                                                  |
 | ------ | --------- | -------------------------------------------------------------------------------------------- |
 | `GET`  | `/health` | Returns `{"status":"ok"}`                                                                    |
 | `GET`  | `/ready`  | Returns `{"status":"ready","chunk_count":N}`; **503** if Chroma is missing, broken, or empty |
 
-
-### Chat (text)
-
-`POST /v1/chat`
-
-The **last** message in `messages` must have `role: "user"`. Omitting `top_k` uses `RAG_TOP_K` from settings (default 6).
-
-```json
-{
-  "messages": [
-    {"role": "user", "content": "How do I upload a bank statement?"}
-  ],
-  "session_id": "optional-uuid",
-  "language_code": "hi-IN",
-  "top_k": 6,
-  "include_sources": true
-}
-```
-
-`include_sources` defaults to `**true**` in the API schema; set it to `false` if you do not need `sources` in the response.
-
-Response shape: `answer`, `sources` (list of excerpts and metadata when enabled), `session_id`.
-
----
 
 ## Supported languages
 
